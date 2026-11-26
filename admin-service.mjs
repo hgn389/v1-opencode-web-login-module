@@ -349,8 +349,12 @@ async function providerReload(config, id, models, remove, baseURL, major) {
   if (!id) return;
   for (let attempt = 0; attempt < 10; attempt++) {
     if (major === 1) {
-      const provider = (await v1Providers({ ...connection, headers })).find(item => item?.id === id);
-      if (remove ? !provider : provider?.options?.baseURL?.replace(/\/$/, '') === baseURL && models.every(model => Object.hasOwn(provider.models || {}, model.id))) return;
+      const catalog = await v1Providers({ ...connection, headers });
+      const targets = Array.isArray(id) ? id : [{ id, models, baseURL }];
+      if (targets.every(target => {
+        const provider = catalog.find(item => item?.id === target.id);
+        return remove ? !provider : provider?.options?.baseURL?.replace(/\/$/, '') === target.baseURL && target.models.every(model => Object.hasOwn(provider.models || {}, model.id));
+      })) return;
       await pause(200);
       continue;
     }
@@ -705,7 +709,8 @@ export function createAdminController(config, dependencies = {}) {
       saved = await runProvider(context, importing ? { action: 'import', providers: input, revision: fields.revision } : remove ? { action: 'remove', id: input.id, revision: fields.revision } : { action: 'save', provider: input, revision: fields.revision });
       if (saved.status !== 200) throw providerFailure(saved.status, saved.message);
       setJob({ type: 'providers', phase: 'running', started: Date.now(), context, backup: saved.backup, recoveryRequired: true, message: 'Đã lưu tệp riêng; đang tải lại cấu hình và kiểm tra model trong OpenCode.' });
-      if (importing) {
+      if (importing && context.major === 1) await reloadProvider(input, [], false, undefined, 1);
+      else if (importing) {
         for (const provider of input) await reloadProvider(provider.id, provider.models, false, provider.baseURL, context.major);
       } else await reloadProvider(input.id, input.models || [], remove, input.baseURL, context.major);
       setJob({ type: 'providers', phase: 'succeeded', message: remove ? 'Đã xóa nhà cung cấp tùy chỉnh và tải lại cấu hình OpenCode.' : 'Đã lưu nhà cung cấp tùy chỉnh; model đã xuất hiện trong OpenCode. Tải lại giao diện để chọn model.' });
@@ -716,7 +721,8 @@ export function createAdminController(config, dependencies = {}) {
           const result = await runProvider(context, { action: 'restore', backup: saved.backup });
           restored = result.status === 200;
           if (restored) {
-            if (importing) for (const provider of input) await reloadProvider(provider.id, [], true, undefined, context.major);
+            if (importing && context.major === 1) await reloadProvider(input, [], true, undefined, 1);
+            else if (importing) for (const provider of input) await reloadProvider(provider.id, [], true, undefined, context.major);
             else await reloadProvider(undefined, [], false, undefined, context.major);
           }
         } catch { restored = false; }

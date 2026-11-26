@@ -94,12 +94,13 @@ const waitJob = async controller => {
 };
 
 test('import jobs preflight every ID, verify every provider, preserve secrets on rollback and persist no input', async () => {
-  for (const scenario of ['success', 'collision', 'reload-failure', 'rollback-conflict', 'credential-change', 'worker-response-lost']) {
+  for (const scenario of ['success', 'collision', 'reload-failure', 'rollback-conflict', 'credential-change', 'worker-response-lost', 'v1-success', 'v1-reload-failure']) {
+    const v1 = scenario.startsWith('v1-'), success = scenario.endsWith('success');
     const f = fixture(), lookups = [], reloads = [], operations = [];
     writeFileSync(join(f.directory, 'package.json'), '{"version":"1.1.2-beta"}');
     const stateDir = join(f.directory, 'state'); let password = 'isolated-admin-password';
     const controller = createAdminController({ installDirectory: f.directory }, { stateDir, password: () => password,
-      providerContext: async () => f.context,
+      providerContext: async () => v1 ? { ...f.context, major: 1 } : f.context,
       providerWorker: async (context, request) => {
         operations.push(request.action);
         const result = providerFileOperation(context, request);
@@ -108,6 +109,12 @@ test('import jobs preflight every ID, verify every provider, preserve secrets on
       },
       providerExists: async id => { lookups.push(id); if (scenario === 'credential-change') password = 'rotated-password'; return scenario === 'collision' && id === 'second'; },
       providerReload: async (id, models, remove, baseURL) => {
+        if (v1) {
+          assert.deepEqual(id.map(provider => provider.id), ['first', 'second']);
+          reloads.push(remove ? 'rollback' : 'apply');
+          if (!remove && !success) throw new Error('Injected batch reload failure');
+          return;
+        }
         reloads.push(id);
          if (id && !remove) { assert.equal(models[0].id, 'coder'); assert.equal(baseURL, provider().baseURL); }
          if (remove) { assert.deepEqual(models, []); assert(!f.read().providers.some(provider => provider.id === id)); }
@@ -126,12 +133,13 @@ test('import jobs preflight every ID, verify every provider, preserve secrets on
       assert.equal((await controller.call(fields)).status, 409);
       const result = await waitJob(controller);
       assert.equal(result.job.type, 'providers');
-      assert.equal(result.job.phase, scenario === 'success' ? 'succeeded' : 'failed');
+       assert.equal(result.job.phase, success ? 'succeeded' : 'failed');
       assert.deepEqual(lookups, ['first', 'second']);
       assert.equal(operations.filter(action => action === 'import').length, ['collision', 'credential-change'].includes(scenario) ? 0 : 1);
-      if (scenario === 'success') assert.deepEqual(reloads, ['first', 'second']);
+       if (scenario === 'success') assert.deepEqual(reloads, ['first', 'second']);
+       if (v1) assert.deepEqual(reloads, success ? ['apply'] : ['apply', 'rollback']);
        if (scenario === 'reload-failure') { assert.deepEqual(reloads, ['first', 'second', 'first', 'second']); assert.equal(result.job.recoveryRequired, false); }
-      if (!['success', 'rollback-conflict', 'worker-response-lost'].includes(scenario)) assert.equal(readFileSync(f.file, 'utf8'), f.original);
+       if (!success && !['rollback-conflict', 'worker-response-lost'].includes(scenario)) assert.equal(readFileSync(f.file, 'utf8'), f.original);
       if (scenario === 'reload-failure') assert.deepEqual(readdirSync(join(f.context.directory, '.web-login-secrets')), []);
       if (['rollback-conflict', 'worker-response-lost'].includes(scenario)) {
         assert.equal(result.job.recoveryRequired, true);

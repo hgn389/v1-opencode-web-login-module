@@ -3,7 +3,9 @@
 A standalone login and security gateway in front of OpenCode. It connects to the OpenCode HTTP API without modifying OpenCode's source files. The systemd installer also enables a separate privileged administration service.
 
 Repository: [hgn389/v1-opencode-web-login-module](https://github.com/hgn389/v1-opencode-web-login-module).
-Current package version: **1.0.0**.
+Current package version: **1.0.1**.
+
+Version 1.0.1 restarts OpenCode only once when importing multiple providers on v1, then verifies the full batch. Rollback also restarts only once.
 
 Version 1.0.0 is the initial release of V1 OpenCode Web Login Module, targeting stable OpenCode v1 from `1.18.20`. The built-in OpenCode model catalog supports individual and provider-group visibility switches. Built-in providers are not editable or included in custom-provider exports. Catalog availability errors leave custom-provider management available.
 
@@ -196,7 +198,7 @@ For library use, install this local package and import `createLoginServer` from 
 
 Migration from another fork requires a **manual installation**: its updater targets a different repository and rejects the new identity. Do not disable its safety checks. Use a reviewed source revision or a verified new release package, then rerun `install` with all the previous host, port, service, origin, proxy and path options. Updating a clone or global CLI alone does not update the running service.
 
-Release 1.0.0 uses an npm-format `.tgz` plus a `.tgz.sha256` sidecar as GitHub Release attachments. GitHub's automatic source archives are not compatible updater assets. `release:pack` is a local packaging command and does not publish anything.
+Releases use an npm-format `.tgz` plus a `.tgz.sha256` sidecar as GitHub Release attachments. GitHub's automatic source archives are not compatible updater assets. `release:pack` is a local packaging command and does not publish anything.
 
 ```sh
 npm ci --ignore-scripts
@@ -208,8 +210,8 @@ git diff --check
 The packaging command runs `npm pack --ignore-scripts`, validates the entire archive through the real updater (including exact runtime manifest, package identity and dependency locks), then writes:
 
 ```text
-v1-opencode-web-login-module-1.0.0.tgz
-v1-opencode-web-login-module-1.0.0.tgz.sha256
+v1-opencode-web-login-module-1.0.1.tgz
+v1-opencode-web-login-module-1.0.1.tgz.sha256
 ```
 
 Only files in the updater allowlist may appear. Tests, packaging scripts, repository metadata and operational state are excluded. The README, font and existing license notices remain included. Dependencies are fetched from npm at installation, not bundled from local `node_modules`.
@@ -219,8 +221,8 @@ Publication is a separate, explicitly authorized step: create a matching version
 After an authorized release exists, users can download both attachments from the repository's release page and verify before installation:
 
 ```sh
-sha256sum --check v1-opencode-web-login-module-1.0.0.tgz.sha256
-sudo npm install -g --ignore-scripts ./v1-opencode-web-login-module-1.0.0.tgz
+sha256sum --check v1-opencode-web-login-module-1.0.1.tgz.sha256
+sudo npm install -g --ignore-scripts ./v1-opencode-web-login-module-1.0.1.tgz
 opencode-web-login --help
 ```
 
