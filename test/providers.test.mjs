@@ -1,0 +1,362 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, lstatSync, symlinkSync, readdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { parse } from 'jsonc-parser';
+import { once } from 'node:events';
+import http from 'node:http';
+import { createAdminController, providerFileOperation, validateCustomProvider, discoverProviderModels, builtinVisibilityProviders } from '../admin-service.mjs';
+import { createLoginServer } from '../index.mjs';
+import { SecurityStore } from '../security.mjs';
+
+const apiKey = 'isolated-custom-provider-api-key';
+const password = 'isolated-provider-admin-password';
+const provider = () => ({ id: 'acme', name: 'Acme API', baseURL: 'https://api.example.com/v1', apiKey, models: [{ id: 'coder', name: 'Coder' }] });
+const sleep = ms => new Promise(done => setTimeout(done, ms));
+const fixture = () => {
+  const directory = mkdtempSync(join(tmpdir(), 'custom-provider-test-'));
+  const context = { directory: join(directory, 'config'), backupDirectory: join(directory, 'backups') };
+  mkdirSync(context.directory, { mode: 0o700 });
+  return { directory, context, file: join(context.directory, 'opencode.jsonc'), close: () => rmSync(directory, { recursive: true, force: true }) };
+};
+
+test('built-in visibility reads the authenticated bounded v2 catalog and returns only real identities', async () => {
+  const calls = [];
+  const providers = await builtinVisibilityProviders({ gateway: { backendHost: '127.0.0.1', backendPort: 4097 } }, {
+    credentials: () => ({ username: 'fixture-user', password }),
+    probe: async (options, bounds) => {
+      calls.push(options.path);
+      assert.equal(options.headers.authorization, 'Basic ' + Buffer.from('fixture-user:' + password).toString('base64'));
+      assert.equal(options.method, undefined);
+      assert.equal(options.hostname, '127.0.0.1'); assert.equal(options.port, 4097);
+      assert.equal(bounds.timeout, 2000); assert.equal(bounds.limit, 4 * 1024 * 1024);
+      return { status: 200, body: JSON.stringify({ location: 'fixture', data: options.path.includes('/provider/')
+        ? { id: 'opencode', integrationID: 'opencode', name: 'OpenCode', settings: { apiKey }, package: 'private-package' }
+        : [{ providerID: 'opencode', id: 'big-pickle', modelID: 'different-upstream-id', name: 'Big Pickle', settings: { apiKey } },
+          { providerID: 'opencode', id: 'beam-free', name: 'Beam Free', enabled: false },
+          { providerID: 'opencode_free_combo_9r', id: 'oc/beam-free', name: 'Not the built-in' },
+          { providerID: 'opencode', id: 'future-model', name: 'Future Model' },
+          { providerID: 'opencode', id: '', name: 'Invalid' }, null] }) };
+    },
+  });
+  assert.deepEqual(calls, ['/api/provider/opencode', '/api/model']);
+  assert.deepEqual(providers, [{ id: 'opencode', name: 'OpenCode', models: [
+    { id: 'big-pickle', name: 'Big Pickle' }, { id: 'beam-free', name: 'Beam Free' }, { id: 'future-model', name: 'Future Model' },
+  ] }]);
+  assert(!JSON.stringify(providers).includes(apiKey));
+});
+
+test('v1 provider save and export use the native config schema', () => {
+  const f = fixture();
+  try {
+    const context = { ...f.context, major: 1, file: f.file };
+    writeFileSync(f.file, '// keep this comment\n{}\n');
+    const read = () => providerFileOperation(context, { action: 'read' });
+    const saved = providerFileOperation(context, { action: 'save', revision: read().revision, provider: provider() });
+    const text = readFileSync(f.file, 'utf8'), config = parse(text);
+    assert.equal(config.provider.acme.npm, '@ai-sdk/openai-compatible');
+    assert.equal(config.provider.acme.options.baseURL, provider().baseURL);
+    assert.match(config.provider.acme.options.apiKey, /^\{file:/);
+    assert(!text.includes(apiKey));
+    assert(text.includes('// keep this comment'));
+    assert.equal(read().providers[0].editable, true);
+    assert.equal(providerFileOperation(context, { action: 'export', includeSecrets: true }).backup.providers[0].apiKey, apiKey);
+    providerFileOperation(context, { action: 'restore', backup: saved.backup });
+    assert.deepEqual(read().providers, []);
+  } finally { f.close(); }
+});
+
+test('v1 visibility uses the active provider catalog and returns only model identities', async () => {
+  const providers = await builtinVisibilityProviders({ gateway: {} }, {
+    major: 1, credentials: () => ({ username: 'fixture', password }),
+    probe: async ({ path, headers }) => {
+      assert.equal(path, '/config/providers');
+      assert.match(headers.authorization, /^Basic /);
+      return { status: 200, body: JSON.stringify({ providers: [{ id: 'opencode', models: {
+        free: { id: 'free', providerID: 'opencode', name: 'Free', apiKey },
+      } }] }) };
+    },
+  });
+  assert.deepEqual(providers, [{ id: 'opencode', name: 'opencode', models: [{ id: 'free', name: 'Free' }] }]);
+});
+
+test('invalid, unavailable and oversized built-in catalogs are rejected without leaking backend errors', async () => {
+  for (const response of [{ status: 401, body: apiKey }, { status: 500, body: apiKey }, { status: 200, body: '{' },
+    { status: 200, body: '{"data":{"id":"opencode_free_combo_9r"}}' },
+    { status: 200, body: '{"data":{"id":"opencode","integrationID":"opencode"}}' }]) {
+    await assert.rejects(builtinVisibilityProviders({ gateway: {} }, {
+      credentials: () => ({ username: 'fixture', password }), probe: async () => response,
+    }));
+  }
+  await assert.rejects(builtinVisibilityProviders({ gateway: {} }, {
+    credentials: () => ({ username: 'fixture', password }), probe: async () => { throw new Error('Response too large'); },
+  }));
+});
+
+test('visibility catalog is separate from configured providers, file mutations and export; errors retain custom providers', async () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.directory, 'package.json'), '{"version":"2.0.4"}');
+    const read = () => providerFileOperation(f.context, { action: 'read' });
+    providerFileOperation(f.context, { action: 'save', revision: read().revision, provider: provider() });
+    const before = read(), file = join(f.context.directory, 'opencode.json'), original = readFileSync(file, 'utf8');
+    const actions = [];
+    let fail = false;
+    const controller = createAdminController({ installDirectory: f.directory }, {
+      stateDir: join(f.directory, 'state'), password: () => password, providerContext: async () => f.context,
+      providerWorker: async (context, request) => { actions.push(request.action); return providerFileOperation(context, request); },
+      visibilityProviders: async () => {
+        if (fail) throw new Error(apiKey);
+        return [{ id: 'opencode', name: 'OpenCode', models: [{ id: 'big-pickle', name: 'Big Pickle' }] }];
+      },
+    });
+    const result = (await controller.call({ operation: 'providers-status' })).providers;
+    assert.deepEqual(result.providers, before.providers);
+    assert.equal(result.revision, before.revision);
+    assert.deepEqual(result.visibilityProviders.map(p => p.id), ['acme', 'opencode']);
+    assert.deepEqual(Object.keys(result.visibilityProviders[0]).sort(), ['id', 'models', 'name']);
+    assert.equal(result.visibilityError, '');
+    const exported = await controller.call({ operation: 'provider-export', includeSecrets: false });
+    assert.equal(exported.status, 200);
+    assert(!JSON.stringify(exported).includes('big-pickle'));
+    assert(!JSON.stringify(exported).includes('"id":"opencode"'));
+    fail = true;
+    const degraded = (await controller.call({ operation: 'providers-status' })).providers;
+    assert.equal(degraded.supported, true); assert.deepEqual(degraded.providers, before.providers);
+    assert.deepEqual(degraded.visibilityProviders.map(p => p.id), ['acme']);
+    assert(degraded.visibilityError.includes('unavailable')); assert(!JSON.stringify(degraded).includes(apiKey));
+    assert(actions.every(action => ['read', 'export'].includes(action)));
+    assert.equal(readFileSync(file, 'utf8'), original);
+  } finally { f.close(); }
+});
+
+test('UI visibility uses the separate catalog while management keeps the configured provider list', () => {
+  const ui = readFileSync(new URL('../admin-ui.js', import.meta.url), 'utf8');
+  const visibility = ui.slice(ui.indexOf('function renderProviderVisibility('), ui.indexOf('function renderVisibilityModels('));
+  assert(visibility.includes('providerData.visibilityProviders || providerData.providers'));
+  const management = ui.slice(ui.indexOf('function renderProviders('), ui.indexOf('function openProviderEditor('));
+  assert(management.includes('providerData.providers || []'));
+  assert(!management.includes('visibilityProviders'));
+  const editor = ui.slice(ui.indexOf('function openProviderEditor('), ui.indexOf('function fillProvider('));
+  assert(editor.includes('if (id && !provider?.editable) return;'));
+  assert(!editor.includes('visibilityProviders'));
+  assert(ui.includes('providerData.visibilityError'));
+});
+
+test('custom provider validation restricts IDs, URLs, interpolation, secrets and model definitions', () => {
+  assert.equal(validateCustomProvider({ ...provider(), id: '9router' }).id, '9router');
+  for (const id of [9, ['9router'], '-router', '_router', 'a'.repeat(64)]) assert.throws(() => validateCustomProvider({ ...provider(), id }));
+  assert.equal(validateCustomProvider({ ...provider(), command: 'arbitrary', file: '/etc/passwd', package: 'arbitrary' }).id, 'acme');
+  assert(!Object.hasOwn(validateCustomProvider(provider()), 'command'));
+  for (const fields of [{ id: '__proto__' }, { id: 'constructor' }, { id: 'UPPERCASE' }, { id: '../file' }, { name: '{file:/etc/passwd}' }, { baseURL: 'file:///etc/passwd' }, { baseURL: 'https://user:pass@api.example.com' }, { baseURL: 'https://api.example.com/?key=secret' }, { baseURL: 'http://127.0.0.1:8000/v1' }, { apiKey: 'key\nvalue' }, { apiKey: '{env:HOME}' }, { clearKey: true }, { models: [] }, { models: [{ id: 'x' }, { id: 'x' }] }, { models: [{ id: '${HOME}' }] }]) assert.throws(() => validateCustomProvider({ ...provider(), ...fields }));
+  assert.equal(validateCustomProvider({ ...provider(), baseURL: 'http://127.0.0.1:8000/v1', allowHttp: true }).allowHttp, true);
+  assert.throws(() => validateCustomProvider({ ...provider(), apiKey: 'khóa-không-hợp-lệ' }));
+  assert.throws(() => validateCustomProvider({ ...provider(), apiKey: 'key with spaces' }));
+});
+
+test('numeric-leading provider IDs retain private keys for rescan, editing and exact rollback', async () => {
+  const f = fixture();
+  try {
+    const read = () => providerFileOperation(f.context, { action: 'read' });
+    const input = { ...provider(), id: '9router' };
+    const created = providerFileOperation(f.context, { action: 'save', revision: read().revision, provider: input });
+    let current = read();
+    assert.equal(current.providers[0].editable, true);
+    const scanned = await discoverProviderModels(f.context, { revision: current.revision, provider: { id: input.id, baseURL: input.baseURL } }, {
+      lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+      request: async options => {
+        assert.equal(options.headers.authorization, 'Bearer ' + apiKey);
+        return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ data: [{ id: 'coder' }] }) };
+      },
+    });
+    assert.equal(scanned.models[0].id, 'coder');
+    const edited = providerFileOperation(f.context, { action: 'save', revision: current.revision, provider: { ...input, apiKey: 'replacement-private-key', baseURL: 'https://another.example.com/v1' } });
+    providerFileOperation(f.context, { action: 'restore', backup: edited.backup });
+    current = read();
+    const file = join(f.context.directory, 'opencode.json');
+    const key = parse(readFileSync(file, 'utf8')).providers[input.id].settings.apiKey.slice(6, -1);
+    assert.equal(readFileSync(key, 'utf8'), apiKey);
+    assert.equal(current.providers[0].baseURL, input.baseURL);
+    providerFileOperation(f.context, { action: 'restore', backup: created.backup });
+    assert.equal(read().providers.length, 0);
+    assert.equal(lstatSync(key, { throwIfNoEntry: false }), undefined);
+  } finally { f.close(); }
+});
+
+test('JSONC edits preserve other settings, hide stored keys, use private files and Git backups, and restore exactly', () => {
+  const f = fixture();
+  const original = `{
+  // Preserve this comment and all unrelated settings.
+  "shell": "/bin/bash",
+  "providers": {
+    "other": {"package":"different-package","settings":{"apiKey":"other-isolated-key"}},
+    "acme": {"package":"@opencode/ai/providers/openai-compatible","env":["ACME_KEY"],"headers":{"Authorization":"isolated-header-key"},"settings":{"baseURL":"https://old.example/v1","apiKey":"old-isolated-key","timeout":123},"models":{"coder":{"limit":{"context":4096}}}}
+  },
+}
+`;
+  writeFileSync(f.file, original, { mode: 0o600 });
+  try {
+    const before = providerFileOperation(f.context, { action: 'read' });
+    assert(!JSON.stringify(before).includes('isolated-key')); assert(!JSON.stringify(before).includes('isolated-header-key')); assert.equal(before.providers.find(p => p.id === 'other').editable, false);
+    const saved = providerFileOperation(f.context, { action: 'save', revision: before.revision, provider: provider() });
+    const text = readFileSync(f.file, 'utf8'), data = parse(text, [], { allowTrailingComma: true });
+    assert(text.includes('// Preserve this comment')); assert.equal(data.shell, '/bin/bash'); assert.equal(data.providers.other.settings.apiKey, 'other-isolated-key');
+    assert.equal(data.providers.acme.settings.timeout, 123); assert.equal(data.providers.acme.models.coder.limit.context, 4096);
+    assert.equal(data.providers.acme.headers, undefined);
+    assert(data.providers.acme.settings.apiKey.startsWith('{file:')); assert(!text.includes(apiKey));
+    const keyFile = data.providers.acme.settings.apiKey.slice(6, -1);
+    assert.equal(readFileSync(keyFile, 'utf8'), apiKey); assert.equal(lstatSync(keyFile).mode & 0o777, 0o600);
+    assert.equal(lstatSync(join(f.context.directory, '.web-login-secrets')).mode & 0o777, 0o700);
+    assert(lstatSync(join(f.context.backupDirectory, '.git')).isDirectory());
+    const after = providerFileOperation(f.context, { action: 'read' }); assert(!JSON.stringify(after).includes(apiKey)); assert(after.providers.find(p => p.id === 'acme').hasKey);
+    assert.throws(() => providerFileOperation(f.context, { action: 'save', revision: before.revision, provider: provider() }), /thay đổi/);
+    assert.equal(providerFileOperation(f.context, { action: 'restore', backup: saved.backup }).status, 200);
+    assert.equal(readFileSync(f.file, 'utf8'), original); assert.equal(lstatSync(keyFile, { throwIfNoEntry: false }), undefined);
+  } finally { f.close(); }
+});
+
+test('provider header credentials cannot survive endpoint changes or explicit key clearing', () => {
+  const f = fixture();
+  try {
+    const original = { providers: { acme: { package: '@opencode/ai/providers/openai-compatible', settings: { baseURL: 'https://old.example/v1' }, headers: { Authorization: 'private-header', 'X-Api-Key': 'private-key', 'X-Request-Format': 'json' }, models: { coder: { name: 'Coder' } } } } };
+    writeFileSync(f.file, JSON.stringify(original), { mode: 0o600 });
+    const read = () => providerFileOperation(f.context, { action: 'read' });
+    assert.equal(read().providers[0].hasKey, true);
+    assert.throws(() => providerFileOperation(f.context, { action: 'save', revision: read().revision, provider: { ...provider(), apiKey: '', baseURL: 'https://new.example/v1' } }), /nhập lại/);
+    providerFileOperation(f.context, { action: 'save', revision: read().revision, provider: { ...provider(), baseURL: 'https://old.example/v1', apiKey: '', clearKey: true } });
+    assert.deepEqual(parse(readFileSync(f.file, 'utf8')).providers.acme.headers, { 'X-Request-Format': 'json' });
+    assert.equal(read().providers[0].hasKey, false);
+    providerFileOperation(f.context, { action: 'save', revision: read().revision, provider: { ...provider(), baseURL: 'https://new.example/v1' } });
+    assert.equal(parse(readFileSync(f.file, 'utf8')).providers.acme.headers, undefined);
+  } finally { f.close(); }
+});
+
+test('provider edits reject unsafe paths, duplicate JSONC keys, endpoint changes with retained keys and conflicting rollback', () => {
+  const f = fixture();
+  try {
+    writeFileSync(f.file, '{"providers":{},"providers":{}}', { mode: 0o600 }); assert.throws(() => providerFileOperation(f.context, { action: 'read' }), /trùng/);
+    writeFileSync(f.file, '{}');
+    let status = providerFileOperation(f.context, { action: 'read' });
+    const saved = providerFileOperation(f.context, { action: 'save', revision: status.revision, provider: provider() });
+    status = providerFileOperation(f.context, { action: 'read' });
+    assert.throws(() => providerFileOperation(f.context, { action: 'save', revision: status.revision, provider: { ...provider(), apiKey: '', baseURL: 'https://another.example/v1' } }), /nhập lại/);
+    writeFileSync(f.file, readFileSync(f.file, 'utf8') + '\n// External edit\n');
+    assert.throws(() => providerFileOperation(f.context, { action: 'restore', backup: saved.backup }), /không ghi đè/);
+    const outside = join(f.directory, 'outside.json'); writeFileSync(outside, '{}', { mode: 0o600 }); rmSync(f.file); symlinkSync(outside, f.file);
+    assert.throws(() => providerFileOperation(f.context, { action: 'read' }), /không an toàn/); assert.equal(readFileSync(outside, 'utf8'), '{}');
+  } finally { f.close(); }
+});
+
+test('provider removal and API key clearing preserve unrelated providers and protect a configured default', () => {
+  const f = fixture();
+  try {
+    const read = () => providerFileOperation(f.context, { action: 'read' });
+    providerFileOperation(f.context, { action: 'save', revision: read().revision, provider: provider() });
+    const file = join(f.context.directory, 'opencode.json');
+    providerFileOperation(f.context, { action: 'save', revision: read().revision, provider: { ...provider(), apiKey: '', clearKey: true } });
+    assert.equal(read().providers[0].hasKey, false);
+    const data = parse(readFileSync(file, 'utf8')); data.model = 'acme/coder'; writeFileSync(file, JSON.stringify(data));
+    assert.throws(() => providerFileOperation(f.context, { action: 'remove', revision: read().revision, id: 'acme' }), /mặc định/);
+    delete data.model; writeFileSync(file, JSON.stringify(data));
+    providerFileOperation(f.context, { action: 'remove', revision: read().revision, id: 'acme' }); assert.equal(read().providers.length, 0);
+  } finally { f.close(); }
+});
+
+test('replacing an endpoint and key uses an immutable new secret file and rolls back without changing the old key', () => {
+  const f = fixture();
+  try {
+    const read = () => providerFileOperation(f.context, { action: 'read' });
+    providerFileOperation(f.context, { action: 'save', revision: read().revision, provider: provider() });
+    const file = join(f.context.directory, 'opencode.json'), before = readFileSync(file, 'utf8');
+    const previousKey = parse(before).providers.acme.settings.apiKey.slice(6, -1);
+    const saved = providerFileOperation(f.context, { action: 'save', revision: read().revision, provider: { ...provider(), apiKey: 'replacement-isolated-key', baseURL: 'https://replacement.example/v1' } });
+    const nextKey = parse(readFileSync(file, 'utf8')).providers.acme.settings.apiKey.slice(6, -1);
+    assert.notEqual(previousKey, nextKey); assert.equal(readFileSync(previousKey, 'utf8'), apiKey); assert.equal(readFileSync(nextKey, 'utf8'), 'replacement-isolated-key');
+    assert.equal(readFileSync(join(f.context.backupDirectory, saved.backup, 'previous-key'), 'utf8'), apiKey);
+    providerFileOperation(f.context, { action: 'restore', backup: saved.backup });
+    assert.equal(readFileSync(file, 'utf8'), before); assert.equal(readFileSync(previousKey, 'utf8'), apiKey); assert.equal(lstatSync(nextKey, { throwIfNoEntry: false }), undefined);
+  } finally { f.close(); }
+});
+
+test('provider jobs use session authorization and require acknowledgement, serialize changes and roll back a failed reload', async () => {
+  for (const fail of [false, true]) {
+    const f = fixture(); let reloads = 0;
+    const code = join(f.directory, 'code'); mkdirSync(code); writeFileSync(join(code, 'package.json'), '{"version":"1.1.2-beta"}');
+    const stateDir = join(f.directory, 'state');
+    const controller = createAdminController({ installDirectory: code }, { stateDir, password: () => password, providerContext: async () => f.context, providerWorker: async (context, request) => providerFileOperation(context, request), providerExists: async () => false,
+      providerReload: async id => { reloads++; if (fail && id) throw new Error('Injected reload failure'); },
+    });
+    try {
+      const status = await controller.call({ operation: 'providers-status' });
+      const fields = { operation: 'provider-save', acknowledge: true, revision: status.providers.revision, provider: provider() };
+      assert.equal((await controller.call({ ...fields, acknowledge: false })).status, 422);
+      assert.equal((await controller.call(fields)).status, 202);
+      assert.equal((await controller.call(fields)).status, 409);
+      assert.equal((await controller.call({ operation: 'preferences', password, automatic: true, channel: 'stable' })).status, 409);
+      for (let attempt = 0; attempt < 50; attempt++) { if ((await controller.call({ operation: 'status' })).job.phase !== 'running') break; await sleep(20); }
+      const result = await controller.call({ operation: 'providers-status' }); assert.equal(result.job.phase, fail ? 'failed' : 'succeeded');
+      assert.equal(result.providers.providers.length, fail ? 0 : 1); assert.equal(reloads, fail ? 2 : 1);
+      assert(!JSON.stringify(result).includes(apiKey)); assert(!readFileSync(join(stateDir, 'job.json'), 'utf8').includes(apiKey));
+    } finally { f.close(); }
+  }
+});
+
+test('provider rollback conflicts require recovery and block further administrative changes', async () => {
+  const f = fixture();
+  const code = join(f.directory, 'code'); mkdirSync(code); writeFileSync(join(code, 'package.json'), '{"version":"1.1.2-beta"}');
+  const stateDir = join(f.directory, 'state');
+  const controller = createAdminController({ installDirectory: code }, { stateDir, password: () => password, providerContext: async () => f.context,
+    providerWorker: async (context, request) => {
+      if (request.action === 'restore') throw new Error('External edit prevents restore');
+      return providerFileOperation(context, request);
+    }, providerExists: async () => false, providerReload: async () => { throw new Error('Reload failed'); } });
+  try {
+    const status = await controller.call({ operation: 'providers-status' });
+    assert.equal((await controller.call({ operation: 'provider-save', acknowledge: true, revision: status.providers.revision, provider: provider() })).status, 202);
+    for (let i = 0; i < 50; i++) { if ((await controller.call({ operation: 'status' })).job.phase === 'failed') break; await sleep(20); }
+    assert.equal((await controller.call({ operation: 'status' })).job.recoveryRequired, true);
+    assert.equal((await controller.call({ operation: 'preferences', password, automatic: true, channel: 'stable' })).status, 409);
+  } finally { f.close(); }
+});
+
+test('provider API enforces authentication, origin, CSRF and field restrictions; native config reads redact secrets and encoded aliases', async () => {
+  const f = fixture(), socket = join(f.directory, 'admin.sock'); let forwarded;
+  const helper = http.createServer(async (req, res) => {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk); forwarded = JSON.parse(Buffer.concat(chunks));
+    const result = forwarded.operation === 'providers-status' ? { status: 200, available: true, providers: { supported: true, revision: 'a'.repeat(64), providers: [] } } : forwarded.operation === 'provider-models' ? { status: 200, models: [{ id: 'coder', name: 'Coder' }], skipped: 0 } : { status: 202, message: 'Fixture accepted' };
+    res.writeHead(result.status, { 'content-type': 'application/json' }); res.end(JSON.stringify(result));
+  });
+  const backend = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'application/json', etag: 'private' }); res.end(JSON.stringify({ name: 'Fixture', settings: { apiKey }, headers: { Authorization: 'isolated-header-value' }, models: [{ id: 'coder', enabled: true }] })); });
+  helper.listen(socket); backend.listen(0, '127.0.0.1'); await Promise.all([once(helper, 'listening'), once(backend, 'listening')]);
+  const reserve = http.createServer(); reserve.listen(0, '127.0.0.1'); await once(reserve, 'listening'); const port = reserve.address().port; await new Promise(done => reserve.close(done));
+  const origin = `http://127.0.0.1:${port}`, database = join(f.directory, 'gateway.sqlite'), gateway = createLoginServer({ port, backendPort: backend.address().port, statePath: database, adminSocket: socket });
+  const store = new SecurityStore(database), cookie = `opencode_login_${port}=${store.createSession('isolated-native-token', origin)}`;
+  await gateway.listen();
+  const request = (path, options = {}) => fetch(origin + path, { ...options, headers: { cookie, 'x-opencode-login': '1', ...options.headers } });
+  try {
+    assert.equal((await fetch(origin + '/web-login/api/providers-status')).status, 401);
+    const status = await (await request('/web-login/api/providers-status')).json();
+    const options = { method: 'POST', headers: { origin, 'content-type': 'application/json', 'x-web-login-csrf': status.csrf }, body: JSON.stringify({ acknowledge: true, revision: status.providers.revision, provider: provider(), file: '/etc/passwd', command: 'arbitrary' }) };
+    assert.equal((await request('/web-login/api/provider-save', { ...options, headers: { ...options.headers, origin: 'https://attacker.example' } })).status, 403);
+    assert.equal((await request('/web-login/api/provider-save', { ...options, headers: { ...options.headers, 'x-web-login-csrf': 'forged' } })).status, 403);
+    assert.equal((await request('/web-login/api/provider-save', options)).status, 202); assert.deepEqual(Object.keys(forwarded).sort(), ['acknowledge', 'operation',  'provider', 'revision']);
+    const scan = { ...options, body: JSON.stringify({ revision: status.providers.revision, provider: { baseURL: provider().baseURL, apiKey }, file: '/etc/passwd', operation: 'password' }) };
+    assert.equal((await fetch(origin + '/web-login/api/provider-models')).status, 401);
+    assert.equal((await request('/web-login/api/provider-models', { ...scan, headers: { ...scan.headers, origin: 'https://attacker.example' } })).status, 403);
+    assert.equal((await request('/web-login/api/provider-models', { ...scan, headers: { ...scan.headers, 'x-web-login-csrf': 'forged' } })).status, 403);
+    assert.equal((await fetch(origin + '/web-login/api/provider-models', scan)).status, 401);
+    store.fail('127.0.0.1');
+    const failures = store.state('127.0.0.1').failures; assert.equal(failures, 1);
+    assert.equal((await request('/web-login/api/provider-models', scan)).status, 200);
+    assert.equal(store.state('127.0.0.1').failures, failures);
+    assert.deepEqual(Object.keys(forwarded).sort(), ['operation',  'provider', 'revision']);
+    assert.equal(forwarded.operation, 'provider-models');
+    const large = { ...provider(), models: Array.from({ length: 500 }, (_, i) => ({ id: 'model-' + i + '-'.repeat(100), name: 'Name'.repeat(30) })) };
+    assert.equal((await request('/web-login/api/provider-save', { ...options, body: JSON.stringify({ acknowledge: true, revision: status.providers.revision, provider: large }) })).status, 202);
+    assert.equal(forwarded.provider.models.length, 500);
+    for (const path of ['/api/provider/acme', '/api/%70rovider/acme', '/api/config', '/api/model', '/provider']) {
+      const response = await request(path); const text = await response.text(); assert.equal(response.status, 200); assert(!text.includes(apiKey)); assert(!text.includes('isolated-header-value')); assert(text.includes('coder')); assert(!response.headers.has('etag'));
+    }
+  } finally { store.close(); await gateway.close(); helper.closeAllConnections(); backend.closeAllConnections(); await Promise.all([new Promise(done => helper.close(done)), new Promise(done => backend.close(done))]); f.close(); }
+});

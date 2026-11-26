@@ -1,0 +1,62 @@
+import { parseArgs } from 'node:util';
+import { configFromEnv, loginAddress } from './config.mjs';
+import { protectedBackend } from './http-client.mjs';
+
+const usage = `OpenCode Web Login
+
+Usage:
+  opencode-web-login serve [--config /absolute/path/login.env]
+  opencode-web-login doctor [--config /absolute/path/login.env]
+  opencode-web-login blocked [--config /absolute/path/login.env]
+  opencode-web-login unblock IP [--config /absolute/path/login.env]
+  opencode-web-login revoke-sessions [--config /absolute/path/login.env]
+  opencode-web-login install --opencode-bin /absolute/path/opencode [options]
+
+Requires Node.js 24+ and stable OpenCode v1 from 1.18.20.
+Run "opencode-web-login install --help" for Linux service installation.
+`;
+
+async function doctor(config) {
+  if (!await protectedBackend(config)) throw new Error('Expected a password-protected OpenCode backend');
+  console.log(JSON.stringify({ ok: true, node: process.versions.node, gateway: config.localOrigin,
+    backend: { host: config.backendHost, port: config.backendPort, protected: true }, statePath: config.statePath,
+    publicOrigins: config.publicOrigins }, null, 2));
+}
+
+export async function runCLI(args = process.argv.slice(2)) {
+  if (Number(process.versions.node.split('.')[0]) < 24) throw new Error('Node.js 24 or newer is required');
+  if (args[0] === 'install') {
+    const { install } = await import('./install.mjs');
+    return install(args.slice(1));
+  }
+  const { values, positionals } = parseArgs({ args, allowPositionals: true, options: { config: { type: 'string' }, help: { type: 'boolean', short: 'h' } } });
+  if (values.help || positionals[0] === 'help') { console.log(usage); return; }
+  if (values.config) process.loadEnvFile(values.config);
+  const command = positionals[0] || 'serve';
+  const config = configFromEnv();
+  if (command === 'serve' && positionals.length <= 1) {
+    const { createLoginServer } = await import('./index.mjs');
+    const login = createLoginServer(config);
+    try { await login.listen(); } catch (error) { await login.close(); throw error; }
+    console.log(`OpenCode web sign-in listening on ${config.localOrigin}`);
+    console.log(`Sign-in page: ${loginAddress(config)}`);
+    let stopping = false;
+    const stop = async () => {
+      if (stopping) return;
+      stopping = true;
+      await login.close();
+      process.off('SIGTERM', stop);
+      process.off('SIGINT', stop);
+    };
+    process.on('SIGTERM', stop);
+    process.on('SIGINT', stop);
+    return login;
+  }
+  if (command === 'doctor' && positionals.length === 1) return doctor(config);
+  if (['blocked', 'unblock', 'revoke-sessions'].includes(command)) {
+    if (positionals.length !== (command === 'unblock' ? 2 : 1)) throw new Error('Invalid command arguments. Run opencode-web-login --help');
+    const { manage } = await import('./manage.mjs');
+    return manage(command, positionals[1], config.statePath);
+  }
+  throw new Error('Unknown command. Run opencode-web-login --help');
+}

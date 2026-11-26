@@ -1,0 +1,127 @@
+import { i18n } from '/login/i18n-client.js';
+
+(() => {
+  'use strict';
+  const items = [['password', 'Đổi mật khẩu'], ['updates', 'Cập nhật Web Login Module'], ['opencode', 'Update & Downgrade'], ['providers', 'Nhà cung cấp tùy chỉnh'], ['blacklist', 'IP Blacklist'], ['transfer', 'Import / Export JSON']];
+  let dialog, frame, focusBefore, providerPending = false;
+  function close() {
+    if (!dialog || providerPending) return;
+    dialog.close(); dialog.remove(); i18n.prune(dialog); dialog = null; frame = null;
+    if (focusBefore?.isConnected) focusBefore.focus();
+  }
+  function open(id, title) {
+    if (providerPending) return;
+    close(); focusBefore = document.activeElement;
+    dialog = document.createElement('dialog'); dialog.className = 'web-login-dialog'; dialog.style.pointerEvents = 'auto'; i18n.attr(dialog, 'aria-label', () => (title));
+    const header = document.createElement('div'); header.className = 'web-login-dialog-header';
+    const navigation = document.createElement('nav'); navigation.className = 'web-login-dialog-tabs'; i18n.attr(navigation, 'aria-label', 'Cài đặt Web Login Module');
+    const select = (selected, label) => {
+      i18n.attr(dialog, 'aria-label', () => label); i18n.attr(frame, 'title', () => label);
+      for (const link of navigation.children) {
+        if (link.dataset.page === selected) {
+          link.setAttribute('aria-current', 'page');
+          link.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        }
+        else link.removeAttribute('aria-current');
+      }
+    };
+    for (const [page, label] of items) {
+      const link = document.createElement('a'); link.href = `/web-login/${page}?embedded=1`; link.dataset.page = page; i18n.text(link, () => label);
+      link.addEventListener('click', event => {
+        if (event.button || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+        event.preventDefault();
+        if (providerPending) return;
+        if (link.getAttribute('aria-current') === 'page') return;
+        select(page, label); frame.src = link.href;
+      });
+      navigation.append(link);
+    }
+    const button = document.createElement('button'); button.type = 'button'; i18n.text(button, () => ('Đóng')); button.addEventListener('click', close);
+    header.append(navigation, button);
+    frame = document.createElement('iframe'); frame.src = `/web-login/${id}?embedded=1`; i18n.attr(frame, 'title', () => (title));
+    const currentFrame = frame;
+    frame.addEventListener('load', () => {
+      if (frame !== currentFrame) return;
+      try {
+        const page = items.find(([page]) => currentFrame.contentWindow.location.pathname === `/web-login/${page}`);
+        if (page) select(...page);
+        currentFrame.contentWindow.postMessage({ type: 'web-login-language', locale: i18n.locale }, location.origin);
+      } catch { /* Ignore a frame that has navigated outside this origin. */ }
+    });
+    select(id, title);
+    dialog.append(header, frame); document.body.append(dialog);
+    dialog.addEventListener('cancel', event => { event.preventDefault(); close(); });
+    let outside = false;
+    const isOutside = event => {
+      const rect = dialog.getBoundingClientRect();
+      return event.target === dialog && (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom);
+    };
+    dialog.addEventListener('pointerdown', event => { outside = isOutside(event); });
+    dialog.addEventListener('click', event => { if (outside && isOutside(event)) close(); outside = false; });
+    dialog.showModal(); button.focus();
+  }
+  function menu(className) {
+    const group = document.createElement('div'); group.className = `web-login-menu ${className}`;
+    const label = document.createElement('div'); label.className = 'web-login-menu-label'; i18n.text(label, () => ('Web Login Module')); group.append(label);
+    for (const [id, title] of items) {
+      const button = document.createElement('button'); button.type = 'button'; i18n.text(button, () => (title));
+      button.addEventListener('click', () => open(id, title)); group.append(button);
+    }
+    return group;
+  }
+  let scheduled = false;
+  let backendVersion;
+  fetch('/global/health', { credentials: 'same-origin', cache: 'no-store' })
+    .then(response => response.ok ? response.json() : undefined)
+    .then(info => {
+      if (/^1\.\d+\.\d+$/.test(info?.version)) { backendVersion = info.version; attach(); }
+    }).catch(() => {});
+  function attach() {
+    scheduled = false;
+    const settings = document.querySelector('[data-testid="settings-screen"]');
+    const legacy = document.querySelector('.settings-dialog');
+    const current = document.querySelector('.settings-v2');
+    const currentSidebar = current?.querySelector('[data-slot="tabs-v2-list"]');
+    const currentGroups = currentSidebar?.querySelector(':scope > div > div');
+    if (currentGroups && !currentGroups.querySelector('.web-login-menu')) currentGroups.append(menu('web-login-legacy'));
+    const footer = currentSidebar?.querySelector('.settings-v2-nav-footer');
+    if (footer && backendVersion && !footer.querySelector('.web-login-backend-version')) {
+      const version = document.createElement('span'); version.className = 'web-login-backend-version';
+      version.textContent = `Backend v${backendVersion}`; footer.append(version);
+    }
+    const sidebar = settings?.querySelector('.settings-nav-groups');
+    if (sidebar && !sidebar.querySelector('.web-login-menu')) sidebar.append(menu('web-login-desktop'));
+    const mobile = settings?.querySelector('.settings-mobile-nav');
+    if (mobile && !settings.querySelector('.web-login-mobile')) mobile.after(menu('web-login-mobile'));
+    const legacySidebar = legacy?.querySelector('[role="tablist"], [data-slot="tabs-list"]') || legacy;
+    if (legacySidebar && !legacySidebar.querySelector('.web-login-menu')) legacySidebar.append(menu('web-login-legacy'));
+    if (!document.querySelector('.web-login-shortcut')) {
+      const shortcut = document.createElement('button');
+      shortcut.className = 'web-login-shortcut'; shortcut.type = 'button';
+      i18n.text(shortcut, () => 'Web Login Module');
+      shortcut.addEventListener('click', () => open(...items[3]));
+      document.body.append(shortcut);
+    }
+  }
+  new MutationObserver(records => {
+    if (scheduled || records.every(record => record.target.closest?.('.web-login-dialog, .web-login-menu'))) return;
+    scheduled = true; requestAnimationFrame(attach);
+  }).observe(document.body, { childList: true, subtree: true });
+  window.addEventListener('message', event => {
+    if (event.origin !== location.origin || !frame || event.source !== frame.contentWindow) return;
+    if (event.data?.type === 'web-login-close') close();
+    if (event.data?.type === 'web-login-provider-pending' && typeof event.data.pending === 'boolean') {
+      providerPending = event.data.pending;
+      dialog.querySelector('.web-login-dialog-header>button').disabled = providerPending;
+      for (const link of dialog.querySelectorAll('.web-login-dialog-tabs a')) {
+        if (providerPending) link.setAttribute('aria-disabled', 'true');
+        else link.removeAttribute('aria-disabled');
+      }
+    }
+  });
+  window.addEventListener('beforeunload', event => { if (providerPending) { event.preventDefault(); event.returnValue = ''; } });
+  i18n.subscribe(locale => {
+    frame?.contentWindow?.postMessage({ type: 'web-login-language', locale }, location.origin);
+  });
+  attach();
+})();

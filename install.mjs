@@ -1,0 +1,355 @@
+import { parseArgs } from 'node:util';
+import { accessSync, constants, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, chmodSync, lstatSync, chownSync, renameSync } from 'node:fs';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { execFileSync } from 'node:child_process';
+import net from 'node:net';
+import { normalizeConfig, loginAddress } from './config.mjs';
+import { readResponse, protectedBackend } from './http-client.mjs';
+import { moduleFiles } from './update.mjs';
+
+const source = dirname(fileURLToPath(import.meta.url));
+const files = moduleFiles;
+const help = `Install an OpenCode Web Login service on Linux with systemd.
+
+Usage: opencode-web-login install --opencode-bin /absolute/path/opencode [options]
+  --name NAME                  Service and system user name (default: opencode-login)
+  --install-dir PATH           Code directory (default: /opt/NAME)
+  --opencode-service UNIT       Existing OpenCode service (default: opencode.service)
+  --host IP                    Listen address (default: 127.0.0.1)
+  --port PORT                  Login port (default: 4096)
+  --backend-port PORT          Private OpenCode port (default: 4097)
+  --public-origins LIST        Comma-separated exact HTTPS origins
+  --trusted-proxies LIST       Trusted IPs/CIDRs (default: 127.0.0.1,::1)
+  --dry-run                    Print the configuration without changing anything
+
+The existing OpenCode service must be installed with its password configured.
+The installer backs up changed files in a private Git repository, installs the
+module and its locked dependencies, then enables and starts the login service.
+It preserves the existing session/lockout database and does not change firewall,
+DNS or TLS configuration. For access on a LAN address, supply --host explicitly.
+Web settings use a separate root administration service over a private Unix
+socket. Automatic updates are disabled until enabled with the current password.
+`;
+
+function path(value, name) {
+  if (!isAbsolute(value) || /[\x00-\x1f\x7f%$"\\]/.test(value) || value.trim() !== value) throw new Error(`${name} must be an absolute path without control characters, quotes, backslashes, % or $`);
+  return resolve(value);
+}
+function command(binary, args) { return execFileSync(binary, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim(); }
+function git(repo, args) { return command('git', ['-C', repo, ...args]); }
+function commit(repo, message) {
+  git(repo, ['add', '--all']);
+  if (git(repo, ['diff', '--cached', '--name-only'])) git(repo, ['-c', 'user.name=System Administrator', '-c', 'user.email=admin@localhost', 'commit', '--quiet', '-m', message]);
+}
+async function checkPort(config, name) {
+  const probe = net.createServer();
+  try {
+    await new Promise((resolve, reject) => {
+      probe.once('error', reject);
+      probe.listen(config.port, config.host, resolve);
+    });
+    await new Promise((resolve) => probe.close(resolve));
+  } catch (error) {
+    if (error.code !== 'EADDRINUSE') throw error;
+    const pid = command('systemctl', ['show', `${name}.service`, '-p', 'MainPID', '--value']);
+    const sockets = command('ss', ['-H', '-ltnp', `sport = :${config.port}`]);
+    const owned = Number(pid) > 0 && sockets.split('\n').some((line) => {
+      const address = line.trim().split(/\s+/)[3];
+      return line.includes(`pid=${pid},`) && [config.authority, `0.0.0.0:${config.port}`, `*:${config.port}`, `[::]:${config.port}`].includes(address);
+    });
+    if (!owned) throw new Error(`Login port ${config.authority} is already used by another process`);
+  }
+}
+async function ready(config) {
+  try {
+    const host = config.host === '0.0.0.0' ? '127.0.0.1' : config.host === '::' ? '::1' : config.host;
+    const response = await readResponse({ hostname: host, port: config.port, path: '/login', headers: { host: config.authority } }, { timeout: 500 });
+    return [200, 403].includes(response.status) && response.body.includes('name="csrf"') && await protectedBackend(config, 500);
+  } catch { return false; }
+}
+function backup(name, targets) {
+  const repo = `/var/lib/${name}-install-backup`;
+  mkdirSync(repo, { recursive: true, mode: 0o700 });
+  chmodSync(repo, 0o700);
+  if (!existsSync(join(repo, '.git'))) command('git', ['init', '--quiet', repo]);
+  const entries = [];
+  for (const target of targets) {
+    const dest = join(repo, target.slice(1));
+    const info = lstatSync(target, { throwIfNoEntry: false });
+    if (!info) { rmSync(dest, { force: true }); entries.push({ target, exists: false }); continue; }
+    if (!info.isFile() || info.uid !== 0 || (info.mode & 0o022)) throw new Error(`Installation target must be a regular root-owned file without group/other write access: ${target}`);
+    entries.push({ target, exists: true, mode: info.mode & 0o777, uid: info.uid, gid: info.gid });
+    mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
+    copyFileSync(target, dest);
+    chmodSync(dest, 0o600);
+  }
+  writeFileSync(join(repo, 'snapshot.json'), JSON.stringify(entries, null, 2), { mode: 0o600 });
+  commit(repo, 'Back up configuration before installing the login module');
+  return { repo, entries };
+}
+
+function restore({ repo, entries }) {
+  for (const entry of entries) {
+    if (!entry.exists) { rmSync(entry.target, { force: true }); continue; }
+    copyFileSync(join(repo, entry.target.slice(1)), entry.target);
+    chmodSync(entry.target, entry.mode);
+    chownSync(entry.target, entry.uid, entry.gid);
+  }
+}
+
+function isActive(unit) {
+  return command('systemctl', ['show', unit, '-p', 'ActiveState', '--value']) === 'active';
+}
+
+function secureParents(target) {
+  for (let current = target; current !== '/'; current = dirname(current)) {
+    if (!existsSync(current)) continue;
+    const info = lstatSync(current);
+    if (!info.isDirectory() || info.uid !== 0 || (info.mode & 0o022)) throw new Error(`Installation directories must be root-owned and not writable by other users: ${current}`);
+  }
+}
+
+export async function install(args) {
+  if (Number(process.versions.node.split('.')[0]) < 24) throw new Error('Node.js 24 or newer is required');
+  const { values, positionals } = parseArgs({ args, allowPositionals: true, options: {
+    'opencode-bin': { type: 'string' }, 'opencode-service': { type: 'string' }, name: { type: 'string' },
+    'install-dir': { type: 'string' }, host: { type: 'string' }, port: { type: 'string' },
+    'backend-port': { type: 'string' }, 'public-origins': { type: 'string' }, 'trusted-proxies': { type: 'string' },
+    'dry-run': { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
+  } });
+  if (values.help) { console.log(help); return; }
+  if (positionals.length) throw new Error('Unexpected installer arguments');
+  const name = values.name || 'opencode-login';
+  if (!/^[a-z][a-z0-9-]{0,27}$/.test(name)) throw new Error('Invalid service name');
+  const backendService = values['opencode-service'] || 'opencode.service';
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9@_.-]*\.service$/.test(backendService) || backendService === `${name}.service`) throw new Error('Invalid OpenCode service name');
+  if (!values['opencode-bin']) throw new Error('--opencode-bin is required');
+  const opencode = path(values['opencode-bin'], 'opencode-bin');
+  const directory = path(values['install-dir'] || `/opt/${name}`, 'install-dir');
+  if (directory === '/' || /^\/(root|home)(\/|$)/.test(directory)) throw new Error('install-dir must be outside home directories');
+  const node = path(process.execPath, 'Node executable');
+  if (/^\/(root|home)(\/|$)/.test(node)) throw new Error('Use a system Node.js 24+ installation outside home directories');
+  const list = (value) => value.split(',').map((part) => part.trim()).filter(Boolean);
+  const config = normalizeConfig({ host: values.host, port: values.port, backendPort: values['backend-port'],
+    statePath: `/var/lib/${name}/security.sqlite`, publicOrigins: list(values['public-origins'] || ''),
+    trustedProxies: values['trusted-proxies'] === undefined ? undefined : list(values['trusted-proxies']) });
+  const envPath = `/etc/${name}.env`;
+  const servicePath = `/etc/systemd/system/${name}.service`;
+  const dropinPath = `/etc/systemd/system/${backendService}.d/web-login.conf`;
+  const adminConfigPath = `/etc/${name}-admin.json`;
+  const adminServicePath = `/etc/systemd/system/${name}-admin.service`;
+  const adminSocket = `/run/${name}-admin/control.sock`;
+  const environment = Object.entries({ LOGIN_HOST: config.host, LOGIN_PORT: config.port,
+    OPENCODE_BACKEND_HOST: config.backendHost, OPENCODE_BACKEND_PORT: config.backendPort,
+    LOGIN_STATE_DB: config.statePath, LOGIN_PUBLIC_ORIGINS: config.publicOrigins.join(','),
+    LOGIN_ADMIN_SOCKET: adminSocket,
+    LOGIN_TRUSTED_PROXIES: config.trustedProxies.join(',') }).map(([key, value]) => `${key}=${JSON.stringify(String(value))}`).join('\n') + '\n';
+  const unit = `[Unit]
+Description=OpenCode Web Login
+Requires=${backendService}
+PartOf=${backendService}
+Wants=network-online.target ${name}-admin.service
+After=network-online.target ${backendService} ${name}-admin.service
+
+[Service]
+Type=simple
+User=${name}
+Group=${name}
+WorkingDirectory=${directory}
+EnvironmentFile=${envPath}
+StateDirectory=${name}
+StateDirectoryMode=0700
+ExecStart=${JSON.stringify(node)} ${JSON.stringify(join(directory, 'bin/opencode-web-login.mjs'))} serve
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+LockPersonality=true
+MemoryMax=256M
+TasksMax=64
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+`;
+  const dropin = `[Service]\nExecStart=\nExecStart=${JSON.stringify(opencode)} serve --hostname 127.0.0.1 --port ${config.backendPort}\n`;
+  const adminConfig = JSON.stringify({ name, installDirectory: directory, backendService, opencode, node,
+    socket: adminSocket, gateway: config }, null, 2) + '\n';
+  const adminUnit = `[Unit]
+Description=OpenCode Web Login Administration
+After=network-online.target ${backendService}
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=${name}
+ExecStart=${JSON.stringify(node)} ${JSON.stringify(join(directory, 'admin-service.mjs'))} serve ${adminConfigPath}
+RuntimeDirectory=${name}-admin
+RuntimeDirectoryMode=0750
+StateDirectory=${name}-admin
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc /var/lib ${JSON.stringify(dirname(directory))}
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
+`;
+  const plan = { service: `${name}.service`, installDirectory: directory, backupDirectory: `/var/lib/${name}-install-backup`,
+    files: { [envPath]: environment, [servicePath]: unit, [dropinPath]: dropin, [adminConfigPath]: adminConfig, [adminServicePath]: adminUnit } };
+  if (values['dry-run']) { console.log(JSON.stringify(plan, null, 2)); return plan; }
+  if (process.platform !== 'linux' || process.getuid() !== 0) throw new Error('System service installation requires root on Linux');
+  accessSync(opencode, constants.X_OK);
+  for (const file of files) accessSync(join(source, file), constants.R_OK);
+  command('git', ['--version']);
+  if (command('systemctl', ['show', backendService, '-p', 'LoadState', '--value']) !== 'loaded') throw new Error('Install and configure the existing OpenCode service first');
+  await checkPort(config, name);
+  secureParents(directory);
+  for (const file of files) secureParents(dirname(join(directory, file)));
+  secureParents(`/var/lib/${name}-install-backup`);
+  for (const target of Object.keys(plan.files)) secureParents(dirname(target));
+  const validation = mkdtempSync(join(tmpdir(), `${name}-unit-`));
+  try {
+    const file = join(validation, `${name}.service`);
+    writeFileSync(file, unit);
+    command('systemd-analyze', ['verify', file]);
+    const adminFile = join(validation, `${name}-admin.service`);
+    writeFileSync(adminFile, adminUnit);
+    command('systemd-analyze', ['verify', adminFile]);
+  } finally { rmSync(validation, { recursive: true, force: true }); }
+  let account;
+  try { account = command('getent', ['passwd', name]).split(':'); }
+  catch (error) { if (error.status !== 2) throw error; }
+  if (account) {
+    if (account[5] !== `/var/lib/${name}` || !account[6].endsWith('/nologin')) throw new Error('Existing service user must have its own state home and nologin shell');
+    const group = command('getent', ['group', name]).split(':');
+    if (group[2] !== account[3]) throw new Error('The service user must use its own matching primary group');
+  }
+  const snapshot = backup(name, [...Object.keys(plan.files), ...files.map((file) => join(directory, file))]);
+  const loginWasActive = isActive(`${name}.service`);
+  const backendWasActive = isActive(backendService);
+  const adminWasActive = isActive(`${name}-admin.service`);
+  let adminWasEnabled = false;
+  let adminWasEnabledAtRuntime = false;
+  try {
+    const enabled = command('systemctl', ['is-enabled', `${name}-admin.service`]);
+    adminWasEnabled = enabled === 'enabled'; adminWasEnabledAtRuntime = enabled === 'enabled-runtime';
+  } catch {}
+  let loginWasEnabled = false;
+  let loginWasEnabledAtRuntime = false;
+  try {
+    const enabled = command('systemctl', ['is-enabled', `${name}.service`]);
+    loginWasEnabled = enabled === 'enabled';
+    loginWasEnabledAtRuntime = enabled === 'enabled-runtime';
+  } catch {}
+  mkdirSync(dirname(directory), { recursive: true, mode: 0o755 });
+  const staging = mkdtempSync(join(dirname(directory), `.${name}-install-`));
+  const oldDependencies = join(staging, 'previous-node_modules');
+  let changed = false;
+  let replacedDependencies = false;
+  let restorePassword;
+  try {
+    for (const file of files) {
+      const dest = join(staging, file);
+      mkdirSync(dirname(dest), { recursive: true, mode: 0o755 });
+      copyFileSync(join(source, file), dest);
+      chmodSync(dest, file.startsWith('bin/') ? 0o755 : 0o644);
+    }
+    // Dependencies must remain readable by the unprivileged gateway user.
+    const previousMask = process.umask(0o022);
+    try {
+      execFileSync('npm', ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: staging, stdio: 'inherit' });
+    } finally {
+      process.umask(previousMask);
+    }
+    const { protectBackendPassword } = await import(pathToFileURL(join(staging, 'admin-service.mjs')).href);
+    restorePassword = protectBackendPassword({ name, backendService });
+    if (!account) command('useradd', ['--system', '--user-group', '--home-dir', `/var/lib/${name}`, '--shell', '/usr/sbin/nologin', name]);
+    changed = true;
+    if (loginWasActive || existsSync(servicePath)) command('systemctl', ['stop', `${name}.service`]);
+    if (adminWasActive || existsSync(adminServicePath)) command('systemctl', ['stop', `${name}-admin.service`]);
+    mkdirSync(directory, { recursive: true, mode: 0o755 });
+    for (const file of files) {
+      const dest = join(directory, file);
+      mkdirSync(dirname(dest), { recursive: true, mode: 0o755 });
+      copyFileSync(join(staging, file), dest);
+      chmodSync(dest, file.startsWith('bin/') ? 0o755 : 0o644);
+    }
+    if (existsSync(join(directory, 'node_modules'))) renameSync(join(directory, 'node_modules'), oldDependencies);
+    replacedDependencies = true;
+    renameSync(join(staging, 'node_modules'), join(directory, 'node_modules'));
+    for (const [target, content] of Object.entries(plan.files)) {
+      mkdirSync(dirname(target), { recursive: true, mode: 0o755 });
+      const mode = target === envPath ? 0o640 : target === adminConfigPath ? 0o600 : 0o644;
+      writeFileSync(target, content, { mode });
+      chmodSync(target, mode);
+    }
+    command('chown', [`root:${name}`, envPath]);
+    command('systemctl', ['daemon-reload']);
+    command('systemctl', ['enable', `${name}.service`]);
+    command('systemctl', ['enable', `${name}-admin.service`]);
+    command('systemctl', ['restart', backendService]);
+    command('systemctl', ['restart', `${name}-admin.service`]);
+    command('systemctl', ['restart', `${name}.service`]);
+    for (let attempt = 0; attempt < 50; attempt++) {
+      if (isActive(`${name}.service`) && isActive(`${name}-admin.service`) && isActive(backendService) && await ready(config)) {
+        rmSync(oldDependencies, { recursive: true, force: true });
+        console.log(JSON.stringify({ installed: true, service: `${name}.service`, config: envPath, gateway: config.localOrigin, loginURL: loginAddress(config), backup: snapshot.repo }, null, 2));
+        return plan;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error('The gateway or password-protected OpenCode backend did not become ready');
+  } catch (error) {
+    let rollback = 'No running configuration was changed';
+    if (changed) {
+      try {
+        command('systemctl', ['stop', `${name}.service`]);
+        command('systemctl', ['stop', `${name}-admin.service`]);
+        if (!loginWasEnabled) command('systemctl', ['disable', `${name}.service`]);
+        if (!adminWasEnabled) command('systemctl', ['disable', `${name}-admin.service`]);
+        restore(snapshot);
+        restorePassword?.();
+        if (replacedDependencies) {
+          rmSync(join(directory, 'node_modules'), { recursive: true, force: true });
+          if (existsSync(oldDependencies)) renameSync(oldDependencies, join(directory, 'node_modules'));
+        }
+        command('systemctl', ['daemon-reload']);
+        if (loginWasEnabled) command('systemctl', ['enable', `${name}.service`]);
+        else if (loginWasEnabledAtRuntime) command('systemctl', ['enable', '--runtime', `${name}.service`]);
+        if (adminWasEnabled) command('systemctl', ['enable', `${name}-admin.service`]);
+        else if (adminWasEnabledAtRuntime) command('systemctl', ['enable', '--runtime', `${name}-admin.service`]);
+        command('systemctl', [backendWasActive ? 'restart' : 'stop', backendService]);
+        if (adminWasActive) command('systemctl', ['restart', `${name}-admin.service`]);
+        if (loginWasActive) command('systemctl', ['restart', `${name}.service`]);
+        else if (existsSync(servicePath)) command('systemctl', ['stop', `${name}.service`]);
+        rollback = 'Previous files, dependencies and service state restored';
+      } catch { rollback = 'Automatic restoration failed; restore from the Git backup'; }
+    } else if (restorePassword) {
+      restorePassword(); command('systemctl', ['daemon-reload']);
+    }
+    throw new Error(`Installation failed: ${error.message}. ${rollback}. Configuration backups: ${snapshot.repo}`, { cause: error });
+  } finally {
+    // Keep old dependencies if restoration failed, for manual recovery.
+    if (!existsSync(oldDependencies)) rmSync(staging, { recursive: true, force: true });
+  }
+}
